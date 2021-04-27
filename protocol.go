@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"io"
 	"log"
 	"net"
@@ -75,7 +76,7 @@ func decodeCommonHeader(buf []byte) *packet {
 	return packet
 }
 
-func sendDataPacket(conn *net.UDPConn, packet *packet) {
+func sendDataPacket(conn net.Conn, packet *packet) {
 	buf := &bytes.Buffer{}
 
 	//  op code and key id
@@ -88,6 +89,15 @@ func sendDataPacket(conn *net.UDPConn, packet *packet) {
 
 	//  content
 	buf.Write(packet.content)
+
+	if _, ok := conn.(*net.TCPConn); ok {
+		var packetLen [2]byte
+		binary.BigEndian.PutUint16(packetLen[:], uint16(buf.Len()))
+		_, err := conn.Write(packetLen[:])
+		if err != nil {
+			log.Fatalf("can't send packet to peer: %v", err)
+		}
+	}
 
 	//  sending
 	_, err := conn.Write(buf.Bytes())

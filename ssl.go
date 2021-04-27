@@ -20,12 +20,13 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"strings"
 	"sync/atomic"
 	"time"
 )
 
 type udpReceiver struct {
-	conn     *net.UDPConn
+	conn     net.Conn
 	stopFlag uint32
 	ctrlChan chan<- *packet
 	dataChan chan<- *packet
@@ -36,7 +37,10 @@ var tunDev tun.Device
 func (ur *udpReceiver) start() {
 	go func() {
 		for {
-			if !ur.iterate() {
+			if _, ok := ur.conn.(*net.TCPConn); ok && !ur.iterateTcp() {
+				break
+			}
+			if _, ok := ur.conn.(*net.UDPConn); ok && !ur.iterateUdp() {
 				break
 			}
 		}
@@ -48,7 +52,7 @@ func (ur *udpReceiver) stop() {
 	ur.conn.Close()
 }
 
-func (ur *udpReceiver) iterate() bool {
+func (ur *udpReceiver) iterateUdp() bool {
 	var buf [2048]byte
 	nr, err := ur.conn.Read(buf[:])
 	if err != nil {
@@ -83,6 +87,56 @@ func (ur *udpReceiver) iterate() bool {
 	return true
 }
 
+func (ur *udpReceiver) iterateTcp() bool {
+	var buf [2048]byte
+	var packetLen, offset uint16
+
+	for {
+		nr, err := ur.conn.Read(buf[offset:])
+		if err != nil {
+			if stopFlag := atomic.LoadUint32(&ur.stopFlag); stopFlag == 1 {
+				return false
+			}
+			if netErr, ok := err.(net.Error); ok {
+				if netErr.Temporary() {
+					log.Printf("ERROR udp recv: %v", netErr)
+					return true
+				} else {
+					log.Fatalf("FATAL udp recv: %v", netErr)
+				}
+			} else {
+				log.Fatalf("FATAL udp recv: %v", err)
+			}
+		}
+		log.Printf("recv %d", nr)
+		offset += uint16(nr)
+		if offset >= 2 && packetLen == 0 {
+			packetLen = binary.BigEndian.Uint16(buf[:2])
+			log.Printf("packetLen %d", packetLen)
+		}
+		if offset >= packetLen+2 && packetLen != 0 {
+			log.Printf("<--:\n%s", hex.Dump(buf[:packetLen+2]))
+			packet := decodeCommonHeader(buf[2 : packetLen+2])
+			if packet != nil {
+				if packet.opCode == kProtoDataV1 {
+					ur.dataChan <- packet
+				} else if packet.opCode == kProtoDataV2 {
+					// strip peer id
+					packet.content = packet.content[3:]
+					ur.dataChan <- packet
+				} else {
+					ur.ctrlChan <- packet
+				}
+			}
+			copy(buf[:], buf[packetLen+2:offset])
+			offset -= packetLen + 2
+			packetLen = 0
+		}
+	}
+
+	return true
+}
+
 type keys struct {
 	encryptCipher [16]byte
 	encryptDigest [20]byte
@@ -91,7 +145,7 @@ type keys struct {
 }
 
 type dataTransporter struct {
-	conn     *net.UDPConn
+	conn     net.Conn
 	stopChan chan struct{}
 
 	cipherRecvChan <-chan *packet
@@ -384,7 +438,8 @@ func (tt *tlsTransporter) run() {
 
 type client struct {
 	peerAddr string
-	conn     *net.UDPConn
+	proto    string
+	conn     net.Conn
 
 	plainSendChan chan []byte
 	plainRecvChan chan []byte
@@ -395,9 +450,10 @@ type client struct {
 	dataTrans   *dataTransporter
 }
 
-func newClient(peerAddr string) *client {
+func newClient(peerAddr, proto string) *client {
 	c := &client{
 		peerAddr:      peerAddr,
+		proto:         proto,
 		plainSendChan: make(chan []byte),
 		plainRecvChan: make(chan []byte),
 	}
@@ -405,13 +461,26 @@ func newClient(peerAddr string) *client {
 }
 
 func (c *client) start() {
-	addr, err := net.ResolveUDPAddr("udp", c.peerAddr)
-	if err != nil {
-		log.Fatalf("can't resolve peer addr '%s': %v", c.peerAddr, err)
-	}
-	c.conn, err = net.DialUDP("udp", nil, addr)
-	if err != nil {
-		log.Fatalf("can't connect to peer: %v", err)
+	if strings.ToLower(c.proto) == "tcp" {
+		addr, err := net.ResolveTCPAddr(c.proto, c.peerAddr)
+		if err != nil {
+			log.Fatalf("can't resolve peer addr '%s': %v", c.peerAddr, err)
+		}
+		c.conn, err = net.DialTCP(c.proto, nil, addr)
+		if err != nil {
+			log.Fatalf("can't connect to peer: %v", err)
+		}
+	} else if strings.ToLower(c.proto) == "udp" {
+		addr, err := net.ResolveUDPAddr(c.proto, c.peerAddr)
+		if err != nil {
+			log.Fatalf("can't resolve peer addr '%s': %v", c.peerAddr, err)
+		}
+		c.conn, err = net.DialUDP(c.proto, nil, addr)
+		if err != nil {
+			log.Fatalf("can't connect to peer: %v", err)
+		}
+	} else {
+		log.Fatalf("error proto %s configrued", c.proto)
 	}
 
 	ciphertextRecvChan := make(chan *packet)
@@ -445,7 +514,7 @@ func (c *client) start() {
 	}
 	c.dataTrans.start()
 
-	time.Sleep(time.Second * 2)
+	time.Sleep(time.Second * 4)
 	go RoutineReadFromTUN(c)
 
 	for {
@@ -522,8 +591,9 @@ func RoutineReadFromTUN(c *client) {
 
 func main() {
 	remoteEndpoint := flag.String("remote", "172.17.0.2:1194", "remote server address and port")
+	proto := flag.String("proto", "udp", "protocol for communicating with remote host.")
 	flag.Parse()
-	c := newClient(*remoteEndpoint)
+	c := newClient(*remoteEndpoint, *proto)
 	log.Printf("client start")
 	c.start()
 }

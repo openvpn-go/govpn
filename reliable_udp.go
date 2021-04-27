@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"io"
 	"log"
 	"net"
@@ -20,7 +21,7 @@ type reliableUdp struct {
 	doneHandshake chan struct{}
 
 	ctrlSendChan chan *packet
-	conn         *net.UDPConn
+	conn         net.Conn
 	sendingPid   uint32
 	waitingAck   map[uint32]chan<- struct{}
 
@@ -37,7 +38,7 @@ type reliableUdp struct {
 	remoteSid sessionId
 }
 
-func dialReliableUdp(conn *net.UDPConn, ctrlRecvChan <-chan *packet) *reliableUdp {
+func dialReliableUdp(conn net.Conn, ctrlRecvChan <-chan *packet) *reliableUdp {
 	ru := &reliableUdp{
 		stopChan:      make(chan struct{}),
 		failChan:      time.After(time.Minute),
@@ -161,7 +162,16 @@ func (ru *reliableUdp) sendCtrlPacket(packet *packet) chan<- struct{} {
 	packet.acks = make(ackArray, nAck)
 	copy(packet.acks, ru.acks)
 
-	_, err := ru.conn.Write(encodeCtrlPacket(packet))
+	buf := encodeCtrlPacket(packet)
+	if _, ok := ru.conn.(*net.TCPConn); ok {
+		var packetLen [2]byte
+		binary.BigEndian.PutUint16(packetLen[:], uint16(len(buf)))
+		_, err := ru.conn.Write(packetLen[:])
+		if err != nil {
+			log.Fatalf("can't send packet to peer: %v", err)
+		}
+	}
+	_, err := ru.conn.Write(buf)
 	if err != nil {
 		log.Fatalf("can't send packet to peer: %v", err)
 	}
@@ -176,7 +186,7 @@ func (ru *reliableUdp) sendCtrlPacket(packet *packet) chan<- struct{} {
 	return nil
 }
 
-func startRetrySendCtrlPacket(conn *net.UDPConn, packet *packet) chan<- struct{} {
+func startRetrySendCtrlPacket(conn net.Conn, packet *packet) chan<- struct{} {
 	stopChan := make(chan struct{})
 	buf := encodeCtrlPacket(packet)
 	go func() {
@@ -187,6 +197,14 @@ func startRetrySendCtrlPacket(conn *net.UDPConn, packet *packet) chan<- struct{}
 			case <-stopChan:
 				return
 			case <-time.After(time.Duration(i) * time.Second):
+				if _, ok := conn.(*net.TCPConn); ok {
+					var packetLen [2]byte
+					binary.BigEndian.PutUint16(packetLen[:], uint16(len(buf)))
+					_, err := conn.Write(packetLen[:])
+					if err != nil {
+						log.Fatalf("can't send packet to peer: %v", err)
+					}
+				}
 				_, err := conn.Write(buf)
 				if err != nil {
 					log.Fatalf("can't send packet to peer: %v", err)
