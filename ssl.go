@@ -11,7 +11,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"flag"
+	"github.com/glacjay/govpn/occ"
+	"golang.zx2c4.com/wireguard/tun"
 	"hash"
 	"io"
 	"io/ioutil"
@@ -27,6 +30,8 @@ type udpReceiver struct {
 	ctrlChan chan<- *packet
 	dataChan chan<- *packet
 }
+
+var tunDev tun.Device
 
 func (ur *udpReceiver) start() {
 	go func() {
@@ -66,6 +71,10 @@ func (ur *udpReceiver) iterate() bool {
 	if packet != nil {
 		if packet.opCode == kProtoDataV1 {
 			ur.dataChan <- packet
+		} else if packet.opCode == kProtoDataV2 {
+			// strip peer id
+			packet.content = packet.content[3:]
+			ur.dataChan <- packet
 		} else {
 			ur.ctrlChan <- packet
 		}
@@ -89,7 +98,8 @@ type dataTransporter struct {
 	plainSendChan  chan<- []byte
 	plainRecvChan  <-chan []byte
 
-	keys *keys
+	packetIDSend uint32
+	keys         *keys
 }
 
 func (dt *dataTransporter) start() {
@@ -106,20 +116,38 @@ func (dt *dataTransporter) stop() {
 	dt.stopChan <- struct{}{}
 }
 
+var messagePing = []byte{
+	0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb,
+	0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48}
+
 func (dt *dataTransporter) iterate() bool {
 	select {
 	case <-dt.stopChan:
 		return false
 
-	case packet := <-dt.cipherRecvChan:
-		plain := dt.decrypt(packet.content)
-		dt.plainSendChan <- plain
+	case packetRecv := <-dt.cipherRecvChan:
+		plain := dt.decrypt(packetRecv.content)
+		log.Printf("dt recv:\n%s", hex.Dump(packetRecv.content))
+		log.Printf("dt decrypted:\n%s", hex.Dump(plain))
+		if bytes.Equal(plain[4:], messagePing) {
+			packetSend := &packet{
+				opCode:  kProtoDataV2,
+				content: dt.encrypt(messagePing, atomic.AddUint32(&dt.packetIDSend, 1)),
+			}
+			log.Printf("dt send:\n%s", hex.Dump(plain))
+			log.Printf("dt encrypted:\n%s", hex.Dump(packetSend.content))
+			sendDataPacket(dt.conn, packetSend)
+		} else {
+			dt.plainSendChan <- plain
+		}
 
 	case plain := <-dt.plainRecvChan:
 		packet := &packet{
-			opCode:  kProtoDataV1,
-			content: dt.encrypt(plain),
+			opCode:  kProtoDataV2,
+			content: dt.encrypt(plain, atomic.AddUint32(&dt.packetIDSend, 1)),
 		}
+		log.Printf("dt send:\n%s", hex.Dump(plain))
+		log.Printf("dt encrypted:\n%s", hex.Dump(packet.content))
 		sendDataPacket(dt.conn, packet)
 	}
 
@@ -159,18 +187,19 @@ func (dt *dataTransporter) decrypt(content []byte) []byte {
 	return plain
 }
 
-func (dt *dataTransporter) encrypt(plain []byte) []byte {
-	paddingLen := 16 - len(plain)%16
+func (dt *dataTransporter) encrypt(plain []byte, packetId uint32) []byte {
+	paddingLen := 16 - (len(plain)+4)%16
 	if paddingLen == 0 {
 		paddingLen = 16
 	}
 
-	content := make([]byte, 20+16+len(plain)+paddingLen)
+	content := make([]byte, 20+16+4+len(plain)+paddingLen)
 	iv := content[20:36]
 	io.ReadFull(rand.Reader, iv)
-	copy(content[20+16:], plain)
+	binary.BigEndian.PutUint32(content[20+16:], packetId)
+	copy(content[20+16+4:], plain)
 	for i := 0; i < paddingLen; i++ {
-		content[i+20+16+len(plain)] = byte(paddingLen)
+		content[i+20+16+4+len(plain)] = byte(paddingLen)
 	}
 	blocker, _ := aes.NewCipher(dt.keys.encryptCipher[:])
 	encrypter := cipher.NewCBCEncrypter(blocker, iv)
@@ -208,13 +237,7 @@ func newTlsTransporter(reliableUdp *reliableUdp, keysChan chan<- *keys,
 
 func (tt *tlsTransporter) start() {
 	tt.handshake()
-	go func() {
-		for {
-			if !tt.iterate() {
-				break
-			}
-		}
-	}()
+	go tt.run()
 }
 
 func (tt *tlsTransporter) stop() {
@@ -228,7 +251,7 @@ type keySource2 struct {
 }
 
 func (tt *tlsTransporter) handshake() {
-	caCertFileContent, err := ioutil.ReadFile("test/ca.cer")
+	caCertFileContent, err := ioutil.ReadFile("/work/c/openvpn-key/ca.crt")
 	if err != nil {
 		log.Fatalf("can't read ca cert file: %v", err)
 	}
@@ -238,7 +261,7 @@ func (tt *tlsTransporter) handshake() {
 		log.Fatalf("can't parse ca cert file")
 	}
 
-	clientCert, err := tls.LoadX509KeyPair("test/client.pem", "test/client.pem")
+	clientCert, err := tls.LoadX509KeyPair("/work/c/openvpn-key/client1.crt", "/work/c/openvpn-key/client1.key")
 	if err != nil {
 		log.Fatalf("can't load client cert and key: %v", err)
 	}
@@ -254,6 +277,8 @@ func (tt *tlsTransporter) handshake() {
 		log.Fatalf("can't handshake tls with remote: %v", err)
 	}
 	tt.reliableUdp.doneHandshake <- struct{}{}
+
+	log.Printf("tls done\n")
 
 	localKeySource := &keySource2{}
 	remoteKeySource := &keySource2{}
@@ -280,16 +305,23 @@ func (tt *tlsTransporter) handshake() {
 	buf.WriteByte(0)
 	//  username and password
 	buf.Write([]byte{0, 0, 0, 0})
+
+	peerInfo := "IV_VER=2.5.0\nIV_PLAT=linux\nIV_PROTO=6\nIV_CIPHERS=AES-128-CBC\nIV_LZ4=1\nIV_LZ4v2=1\nIV_LZO=1\nIV_COMP_STUB=1\nIV_COMP_STUBv2=1\nIV_TCPNL=1\n"
+	binary.BigEndian.PutUint16(lenBuf, uint16(len(peerInfo)+1))
+	buf.Write(lenBuf)
+	buf.WriteString(peerInfo)
+	buf.WriteByte(0)
 	_, err = tt.conn.Write(buf.Bytes())
 	if err != nil {
 		log.Fatalf("can't send key to remote: %v", err)
 	}
 
 	recvBuf := make([]byte, 1024)
-	_, err = tt.conn.Read(recvBuf)
+	recvLen, err := tt.conn.Read(recvBuf)
 	if err != nil {
 		log.Fatalf("can't get key from remote: %v", err)
 	}
+	log.Printf("recv key:\n%s", hex.Dump(recvBuf[:recvLen]))
 	//copy(remoteKeySource.preMaster[:], recvBuf[5:53])
 	copy(remoteKeySource.random1[:], recvBuf[5:37])
 	copy(remoteKeySource.random2[:], recvBuf[37:69])
@@ -309,13 +341,45 @@ func (tt *tlsTransporter) handshake() {
 	copy(keys.decryptCipher[:], keyBuf[128:144])
 	copy(keys.decryptDigest[:], keyBuf[192:212])
 	tt.keysChan <- keys
-
 	log.Printf("done negotiate initial keys")
 }
 
 func (tt *tlsTransporter) iterate() bool {
 	time.Sleep(time.Second)
 	return true
+}
+
+func (tt *tlsTransporter) run() {
+
+	recvBuf := make([]byte, 1024)
+	for {
+		recvLen, err := tt.conn.Read(recvBuf)
+		if err != nil {
+			log.Fatalf("tls recv error %v", err)
+		}
+		log.Printf("recv control v1:\n%s", hex.Dump(recvBuf[:recvLen]))
+		if recvLen > len(occ.CmdPushReply) && string(recvBuf[:len(occ.CmdPushReply)]) == occ.CmdPushReply {
+			log.Printf("<--- %s\n", occ.CmdPushReply)
+			tunDev, _ = tun.CreateTUN("govpn1", 1500)
+			log.Println(tunDev.Name())
+		} else if recvLen > len(occ.CmdPushRequest) && string(recvBuf[:len(occ.CmdPushRequest)]) == occ.CmdPushRequest {
+			log.Printf("<--- %s\n", occ.CmdPushRequest)
+		} else if recvLen > len(occ.CmdAuthFailed) && string(recvBuf[:len(occ.CmdAuthFailed)]) == occ.CmdAuthFailed {
+			log.Printf("<--- %s\n", occ.CmdAuthFailed)
+		} else if recvLen > len(occ.CmdRestart) && string(recvBuf[:len(occ.CmdRestart)]) == occ.CmdRestart {
+			log.Printf("<--- %s\n", occ.CmdRestart)
+		} else if recvLen > len(occ.CmdHalt) && string(recvBuf[:len(occ.CmdHalt)]) == occ.CmdHalt {
+			log.Printf("<--- %s\n", occ.CmdHalt)
+		} else if recvLen > len(occ.CmdInfoPre) && string(recvBuf[:len(occ.CmdInfoPre)]) == occ.CmdInfoPre {
+			log.Printf("<--- %s\n", occ.CmdInfoPre)
+		} else if recvLen > len(occ.CmdInfo) && string(recvBuf[:len(occ.CmdInfo)]) == occ.CmdInfo {
+			log.Printf("<--- %s\n", occ.CmdInfo)
+		} else if recvLen > len(occ.CmdCrResponse) && string(recvBuf[:len(occ.CmdCrResponse)]) == occ.CmdCrResponse {
+			log.Printf("<--- %s\n", occ.CmdCrResponse)
+		} else {
+			log.Printf("<--- unknown type\n")
+		}
+	}
 }
 
 type client struct {
@@ -366,6 +430,11 @@ func (c *client) start() {
 	c.tlsTrans.start()
 	keys := <-keysChan
 
+	log.Printf("encryptCipher:\n%s", hex.Dump(keys.encryptCipher[:]))
+	log.Printf("encryptDigest:\n%s", hex.Dump(keys.encryptDigest[:]))
+	log.Printf("decryptCipher:\n%s", hex.Dump(keys.decryptCipher[:]))
+	log.Printf("decryptDigest:\n%s", hex.Dump(keys.decryptDigest[:]))
+
 	c.dataTrans = &dataTransporter{
 		conn:           c.conn,
 		stopChan:       make(chan struct{}),
@@ -376,10 +445,15 @@ func (c *client) start() {
 	}
 	c.dataTrans.start()
 
+	time.Sleep(time.Second * 2)
+	go RoutineReadFromTUN(c)
+
 	for {
 		plain := <-c.plainSendChan
-		log.Printf("recv from server: %#v", plain)
-		c.plainRecvChan <- plain
+		log.Printf("recv data from server:\n%s", hex.Dump(plain))
+		tunDev.Write(plain, 4)
+
+		//c.plainRecvChan <- plain
 	}
 }
 
@@ -434,8 +508,20 @@ func tls1Phash(hasher func() hash.Hash, secret, seed []byte, result []byte) {
 	}
 }
 
+func RoutineReadFromTUN(c *client) {
+	buffer := make([]byte, 2048)
+	for {
+		size, err := tunDev.Read(buffer[:], 4)
+		if err != nil {
+			panic(err)
+		} else {
+			c.plainRecvChan <- buffer[4 : size+4]
+		}
+	}
+}
+
 func main() {
-	remoteEndpoint := flag.String("remote", "127.0.0.1:1194", "remote server address and port")
+	remoteEndpoint := flag.String("remote", "172.17.0.2:1194", "remote server address and port")
 	flag.Parse()
 	c := newClient(*remoteEndpoint)
 	log.Printf("client start")

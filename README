@@ -1,1 +1,7 @@
 It works. By now it's able to communicate with the simplest OpenVPN.
+
+
+        _ data channel
+udp -> |                                      _
+       |_ control channel -> reliable_udp -> |
+                                             |_ control v1  -> tls

@@ -16,6 +16,10 @@ const (
 	kProtoDataV1                   = 6
 	kProtoControlHardResetClientV2 = 7
 	kProtoControlHardResetServerV2 = 8
+	kProtoDataV2                   = 9
+
+	p_key_id_mask  = 0x7
+	p_opcode_shift = 3
 )
 
 type sessionId [8]byte
@@ -29,6 +33,33 @@ type packet struct {
 	remoteSid sessionId
 	id        uint32
 	content   []byte
+}
+
+func openvpnOpcodeString(opcode uint8) string {
+	opcode = opcode >> p_opcode_shift
+
+	switch opcode {
+	case kProtoControlHardResetClientV1:
+		return "control hard reset client v1"
+	case kProtoControlHardResetServerV1:
+		return "control hard reset server v2"
+	case kProtoControlSoftResetV1:
+		return "control soft reset v1"
+	case kProtoControlV1:
+		return "control v1"
+	case kProtoAckV1:
+		return "ack v1"
+	case kProtoDataV1:
+		return "data v1"
+	case kProtoControlHardResetClientV2:
+		return "control hard reset client v2"
+	case kProtoControlHardResetServerV2:
+		return "control hard reset server v2"
+	case kProtoDataV2:
+		return "data v2"
+	default:
+		return "unKnown opcode"
+	}
 }
 
 func decodeCommonHeader(buf []byte) *packet {
@@ -49,6 +80,11 @@ func sendDataPacket(conn *net.UDPConn, packet *packet) {
 
 	//  op code and key id
 	buf.WriteByte((packet.opCode << 3) | (packet.keyId & 0x07))
+
+	// peer id
+	buf.WriteByte(0)
+	buf.WriteByte(0)
+	buf.WriteByte(0)
 
 	//  content
 	buf.Write(packet.content)
@@ -92,32 +128,38 @@ func encodeCtrlPacket(packet *packet) []byte {
 }
 
 func decodeCtrlPacket(packet *packet) *packet {
+	//log.Printf("decodeCtrlPacket :\n%s", hex.Dump(packet.content))
 	buf := bytes.NewBuffer(packet.content)
 
 	//  remote session id
 	_, err := io.ReadFull(buf, packet.localSid[:])
 	if err != nil {
+		log.Println("read localSid")
 		return nil
 	}
 
 	//  ack array
 	code, err := buf.ReadByte()
 	if err != nil {
+		log.Println("read acl len")
 		return nil
 	}
 	nAcks := int(code)
+
 	packet.acks = make([]uint32, nAcks)
 	for i := 0; i < nAcks; i++ {
 		packet.acks[i], err = bufReadUint32(buf)
 		if err != nil {
+			log.Println("read ack")
 			return nil
 		}
 	}
 
-	//  local session id
+	//  remote session id
 	if nAcks > 0 {
 		_, err = io.ReadFull(buf, packet.remoteSid[:])
 		if err != nil {
+			log.Println("remoteSid")
 			return nil
 		}
 	}
@@ -126,6 +168,7 @@ func decodeCtrlPacket(packet *packet) *packet {
 	if packet.opCode != kProtoAckV1 {
 		packet.id, err = bufReadUint32(buf)
 		if err != nil {
+			log.Println("packet id")
 			return nil
 		}
 	}

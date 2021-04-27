@@ -88,8 +88,10 @@ func (ru *reliableUdp) iterate() bool {
 	case <-ru.doneHandshake:
 		ru.failChan = nil
 
-	case packet := <-ru.ctrlRecvChan:
-		ru.recvCtrlPacket(packet)
+	case packet, ok := <-ru.ctrlRecvChan:
+		if ok {
+			ru.recvCtrlPacket(packet)
+		}
 
 	case packet := <-ru.ctrlSendChan:
 		packet.id = ru.sendingPid
@@ -104,8 +106,15 @@ func (ru *reliableUdp) iterate() bool {
 }
 
 func (ru *reliableUdp) recvCtrlPacket(packet *packet) {
+	if packet == nil {
+		log.Printf("recvCtrlPacket nil")
+		return
+	}
 	packet = decodeCtrlPacket(packet)
-
+	if packet == nil {
+		log.Printf("recvCtrlPacket nil")
+		return
+	}
 	if packet.opCode != kProtoAckV1 {
 		ru.acks = append(ru.acks, packet.id)
 	}

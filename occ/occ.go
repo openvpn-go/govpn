@@ -1,8 +1,8 @@
 package occ
 
 import (
-	"log"
 	"github.com/glacjay/govpn/opt"
+	"log"
 	"time"
 )
 
@@ -93,3 +93,14 @@ func (occ *OCC) CheckOccMessage(msg []byte) bool {
 	}
 	return true
 }
+
+const (
+	CmdPushRequest = "PUSH_REQUEST"
+	CmdPushReply   = "PUSH_REPLY"
+	CmdAuthFailed  = "AUTH_FAILED"
+	CmdRestart     = "RESTART"
+	CmdHalt        = "HALT"
+	CmdInfoPre     = "INFO_PRE"
+	CmdInfo        = "INFO"
+	CmdCrResponse  = "CR_RESPONSE"
+)
